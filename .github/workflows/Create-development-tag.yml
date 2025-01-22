@@ -1,0 +1,161 @@
+name: Merge RB into dev | Unlock dev | Create Dev Tag
+
+
+
+env:
+  REPO_URL: "https://api.github.com/repos/${{ github.repository }}/branches/development/protection"
+  AUTH_TOKEN: ${{ secrets.supertoken }}
+
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: 'The name of the latest dev Release branch (e.g., Release-v1.0.0-dev)'
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+
+jobs:
+  validate-input:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Validate release branch input
+        run: |
+          if [[ ! "${{ github.event.inputs.release_branch }}" =~ ^Release- ]]; then
+            echo "Error: The release branch must start with 'Release-' (e.g., Release-v1.0.0-dev)."
+            exit 1
+          fi
+
+
+  unlock-development:
+    runs-on: ubuntu-latest
+    needs: validate-input
+    steps:
+        - name: Fetch and Lock Target Branch
+          env:
+            GITHUB_TOKEN: $AUTH_TOKEN
+          run: |
+          
+            echo "repository: ${{ github.repository }}"
+            echo "URL : $REPO_URL"
+
+            # Fetch protection settings
+            PROTECTION_SETTINGS=$(curl -s -H "Authorization: token ${{ secrets.supertoken }}" \
+                                      -H "Accept: application/vnd.github+json" \
+                                      "${REPO_URL}")
+
+
+            
+
+
+            # Echo the fetched protection settings for debugging
+            echo "$PROTECTION_SETTINGS"
+
+
+
+            echo "Current protection settings for development: $PROTECTION_SETTINGS"
+
+
+
+            # Fetch current protection settings and update lock_branch while retaining other values
+            UPDATED_SETTINGS=$(echo "$PROTECTION_SETTINGS" | jq '{
+            required_status_checks: .required_status_checks,
+            enforce_admins: .enforce_admins.enabled,
+            required_pull_request_reviews: .required_pull_request_reviews,
+            restrictions: .restrictions,
+            lock_branch: false
+            }')
+
+
+
+            # Debugging: Display the payload and URL
+            echo "Request URL: ${REPO_URL}branches/development/protection"
+            echo "Updated Payload: $UPDATED_SETTINGS"
+
+
+
+            # Perform the PUT request
+            curl -X PUT \
+              -H "Authorization: token ${{ secrets.supertoken }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d "$UPDATED_SETTINGS" \
+              "${REPO_URL}"
+
+
+
+            echo "development branch protection rules updated to unlock."
+
+  merge-to-development:
+    runs-on: ubuntu-latest
+    needs: unlock-development
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Strip "Release-" Prefix
+        run: |
+          echo "Stripping 'Release-' prefix from the release branch..."
+          STRIPPED_BRANCH=$(echo "${{ github.event.inputs.release_branch }}" | sed 's/^Release-//')
+          echo "Stripped branch name: $STRIPPED_BRANCH"
+          echo "stripped_branch=$STRIPPED_BRANCH" >> $GITHUB_ENV
+
+       # Set up SSH for Git
+      - name: Set up SSH for Git
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.sshvivobook }}" | tr -d '\r' > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Merge Release branch into development
+        run: |
+          git config --global user.name "LeoLuiten"
+          git config --global user.email "leonardoluiten@gmail.com"
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+          git checkout -B development origin/development
+
+          if git show-ref --verify --quiet refs/remotes/origin/${{ github.event.inputs.release_branch }}; then
+            echo "Release branch exists. Proceeding with merge."
+              
+            # Store the result of git diff
+            git diff --quiet origin/development..origin/${{ github.event.inputs.release_branch }}
+            diff_exists=$?
+
+            # Check if there are changes
+            if [ $diff_exists -eq 0 ]; then
+              echo "No changes to merge. Creating a placeholder commit."
+              git commit --allow-empty -m "v.${{ env.stripped_branch }}-dev"
+            else
+              echo "Differences detected. Proceeding with merge."
+              git merge origin/${{ github.event.inputs.release_branch }} -m "${{ env.stripped_branch }} released"
+            fi
+
+            git push origin development
+          else
+            echo "Release branch ${{ github.event.inputs.release_branch }} does not exist. Skipping merge."
+          fi
+
+  create-dev-tag:
+    runs-on: ubuntu-latest
+    needs: merge-to-development
+    steps:
+        - name: Checkout Repository
+          uses: actions/checkout@v3
+        
+        - name: Create and push tag
+          run: |
+                # Set the tag name based on the stripped branch or any other naming convention
+                TAG_NAME="${{ github.event.inputs.release_branch }}-$(date +%d-%m-%Y)-T-$(date +%H-%M-%S)"
+        
+                # Create the tag
+                git tag $TAG_NAME
+        
+                # Push the tag to the remote repository
+                git push origin $TAG_NAME

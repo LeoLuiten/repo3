@@ -1,0 +1,137 @@
+name: Enforce PR Title and Commit Message for Feature Branches
+
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+
+jobs:
+  validate-pr-and-update-title:
+    runs-on: ubuntu-latest
+    if: >
+      github.event.pull_request.base.ref == 'development' &&
+      !startsWith(github.head_ref, 'release/') &&
+      !startsWith(github.head_ref, 'hotfix/') &&
+      github.head_ref != 'main'
+
+
+    steps:
+      - name: Validate PR title and enforce format
+        env:
+          GITHUB_TOKEN: ${{ secrets.supertoken }}
+        shell: bash
+        run: |
+          echo "Fetching branch and PR details..."
+          BRANCH_NAME="${{ github.head_ref }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+
+          # Fetch current PR title
+          CURRENT_TITLE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/$REPO/pulls/$PR_NUMBER | jq -r .title)
+
+
+          echo "Current PR Title: $CURRENT_TITLE"
+          echo "Branch Name: $BRANCH_NAME"
+
+
+          # Check if title differs from branch name
+          if [[ "$CURRENT_TITLE" != *"$BRANCH_NAME"* ]]; then
+            echo "PR Title differs from branch name. Updating PR title..."
+
+
+            # Construct new title (if required format applies, adjust accordingly)
+            if [[ "$CURRENT_TITLE" =~ ^(--(minor|major|patch)) ]]; then
+              FLAG="${BASH_REMATCH[0]}"
+              NEW_TITLE="${FLAG} | ${BRANCH_NAME}"
+            else
+              # Default fallback if no flag is present
+              NEW_TITLE="$BRANCH_NAME"
+            fi
+
+
+            # Update PR title
+            curl -X PATCH \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/$REPO/pulls/$PR_NUMBER \
+              -d "{\"title\": \"$NEW_TITLE\"}"
+
+
+            echo "PR Title updated to: $NEW_TITLE"
+          else
+            echo "PR Title matches the branch name. No update needed."
+          fi
+
+
+          # Check if the title starts with --minor, --major, or --patch
+          if [[ "$CURRENT_TITLE" =~ ^(--(minor|major|patch)) ]]; then
+            FLAG="${BASH_REMATCH[0]}"
+            NEW_TITLE="${FLAG} | ${BRANCH_NAME}"
+            echo "New PR Title: $NEW_TITLE"
+          else
+            echo "ERROR: PR title must start with '--minor', '--major', or '--patch'. Current title: $CURRENT_TITLE"
+            exit 1
+          fi
+
+
+          # Update PR title to enforce format
+          curl -X PATCH \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO/pulls/$PR_NUMBER \
+            -d "{\"title\": \"$NEW_TITLE\"}"
+
+
+      - name: Set squash merge commit message to PR title
+        env:
+          GITHUB_TOKEN: ${{ secrets.supertoken }}
+        shell: bash
+        run: |
+          echo "Updating squash merge commit message..."
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          REPO="${{ github.repository }}"
+
+
+          # Fetch updated PR title
+          UPDATED_TITLE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/$REPO/pulls/$PR_NUMBER | jq -r .title)
+
+
+          # Fetch the current PR body (used for squash merge commit message)
+          OLD_BODY=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/$REPO/pulls/$PR_NUMBER | jq -r .body)
+
+
+          echo "Updated PR Title: $UPDATED_TITLE"
+
+
+          # Update the squash merge commit message and merge directly 
+          curl -X PUT \
+          -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/$REPO/pulls/$PR_NUMBER/merge \
+          -d '{
+            "commit_title": "'"${UPDATED_TITLE}"'",
+            "commit_message": "'"${OLD_BODY}"'",
+            "merge_method": "squash"
+
+          }'
+        # # Update the squash merge commit message
+        #   curl -X PATCH \
+        #     -H "Authorization: token $GITHUB_TOKEN" \
+        #     -H "Accept: application/vnd.github.v3+json" \
+        #     https://api.github.com/repos/$REPO/pulls/$PR_NUMBER \
+        #     -d "{\"body\": \"$UPDATED_TITLE\"}"
+
+
+
+
+
+
+

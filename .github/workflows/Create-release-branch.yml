@@ -1,0 +1,279 @@
+name: Create Release Branch
+
+
+
+env:
+  REPO_URL: "https://api.github.com/repos/${{ github.repository }}/"
+  VERSIONING_REPO_URL: "https://api.github.com/LeoLuiten/versioning"
+  VERSION_FILE: "versioning.json"
+  SSH_PRIVATE_KEY: ${{ secrets.sshvivobook }}
+  GITHUB_TOKEN: ${{ secrets.supertoken }}
+  TARGET_BRANCH: "development"
+
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      next_version:
+        description: "Next version number"
+        required: true
+      start_ref:
+        description: "Starting commit reference (commit SHA, branch, or tag)"
+        required: true
+
+
+
+jobs:
+  create-release-branch:
+    runs-on: ubuntu-latest
+
+
+
+    steps:
+      # Checkout the repository
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+
+
+      # Install necessary tools
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+
+
+      # Set up SSH for Git
+      - name: Set up SSH for Git
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+
+
+      - name: Configure Git User
+        run: |
+            echo "Configuring Git user"
+            git config --global user.name "GitHub Action Bot"
+            git config --global user.email "actions@github.com"
+
+
+
+      # Create Release Branch
+      - name: Create Release Branch
+        run: |
+            echo "Using starting reference: ${{ github.event.inputs.start_ref }}"
+            START_REF="${{ github.event.inputs.start_ref }}"
+            NEXT_VERSION="${{ github.event.inputs.next_version }}"
+
+
+
+            set -e
+            echo "Fetching all branches..."
+            git fetch --all --tags
+
+
+
+            # Check out the target branch
+            echo "Checking out target branch: $TARGET_BRANCH"
+            git checkout $TARGET_BRANCH
+            git reset --hard origin/$TARGET_BRANCH
+
+
+
+            echo "Verifying starting reference: $START_REF"
+            if ! git rev-parse "$START_REF" >/dev/null 2>&1; then
+              echo "Invalid starting reference: $START_REF. Aborting."
+              exit 1
+            fi
+
+
+
+            # Resolve the full SHA and short SHA for the starting reference
+            FULL_REF=$(git rev-parse "$START_REF")
+            SHORT_REF=$(git rev-parse --short "$START_REF")
+
+
+
+            # Get the commit message for the starting reference
+            COMMIT_MESSAGE=$(git log -1 --format=%s "$START_REF")
+
+
+
+            echo "Resolved starting reference:"
+            echo "  Full SHA: $FULL_REF"
+            echo "  Short SHA: $SHORT_REF"
+            echo "  Commit message: $COMMIT_MESSAGE"
+
+
+
+            # Generate commits in chronological order as individual JSON objects
+            COMMITS_JSON=$(git log --reverse --format='{"commit_hash":"%H", "commit_message":"%s"}' "$FULL_REF"..HEAD)
+
+
+
+            # Wrap the raw JSON objects in an array
+            COMMITS_JSON_ARRAY="[$(echo "$COMMITS_JSON" | sed ':a;N;$!ba;s/\n/,/g')]"
+
+
+
+            # Debug: Print the properly formatted JSON array
+            echo "Properly formatted COMMITS_JSON_ARRAY: $COMMITS_JSON_ARRAY"
+
+
+
+            
+
+
+
+            echo "Commits from $FULL_REF to HEAD in chronological order:"
+            echo "$COMMITS_JSON_ARRAY" | jq .
+
+
+            if [ -z "$COMMITS_JSON" ]; then
+              echo "No new commits found after $FULL_REF. Creating a placeholder commit."
+
+              # Ensure the target branch is checked out
+              git checkout $TARGET_BRANCH
+              git reset --hard origin/$TARGET_BRANCH
+
+              # Create an empty commit
+              git commit --allow-empty -m "v.${{ github.event.inputs.next_version }}-dev"
+
+              # Push the empty commit to the target branch
+              echo "Pushing the placeholder commit to $TARGET_BRANCH..."
+              git remote set-url origin git@github.com:${{ github.repository }}.git
+              git push origin "$TARGET_BRANCH"
+
+              echo "Placeholder commit pushed successfully named ${NEXT_VERSION}"
+
+              ## Create a tag for the placeholder commit
+              # Set the tag name based on the stripped branch or any other naming convention
+                TAG_NAME="T-Release-v-${{ github.event.inputs.next_version }}-$(date +%d-%m-%Y)-T-$(date +%H-%M-%S)"
+        
+                # Create the tag
+                git tag $TAG_NAME
+        
+                # Push the tag to the remote repository
+                git push origin $TAG_NAME
+
+              exit 0
+            fi
+
+
+
+            echo "Creating release branch from reference: $FULL_REF"
+            BRANCH_NAME="Release-v-${NEXT_VERSION}"
+            git checkout -b "$BRANCH_NAME" "$FULL_REF"
+
+
+
+            echo "Cherry-picking commits onto the release branch..."
+
+
+
+            # Debug: Print the raw JSON input
+            echo "Raw COMMITS_JSON: $COMMITS_JSON"
+
+
+
+            # Debug: Validate JSON format
+            echo "Validating JSON format with jq..."
+            echo "$COMMITS_JSON" | jq . || { echo "Invalid JSON format"; exit 1; }
+
+
+
+            # Process commits using jq and a while loop
+            echo "$COMMITS_JSON_ARRAY" | jq -r '.[].commit_hash' | while read -r COMMIT; do
+              # Debug: Log each commit hash
+              echo "Processing commit hash: $COMMIT"
+
+
+              # Check if the commit is a merge commit
+              if git cat-file -p "$COMMIT" | grep -q "^parent .*"; then
+                PARENT_COUNT=$(git cat-file -p "$COMMIT" | grep "^parent " | wc -l)
+                if [ "$PARENT_COUNT" -gt 1 ]; then
+                  echo "Commit $COMMIT is a merge commit. Using -m 1."
+                  git cherry-pick -m 1 --strategy=recursive --strategy-option=theirs "$COMMIT" || {
+                    # Skip empty cherry-picks
+                    if git status | grep -q "nothing to commit, working tree clean"; then
+                      echo "Cherry-pick for merge commit $COMMIT is empty. Skipping."
+                      git cherry-pick --skip
+                    else
+                      echo "Cherry-pick failed for merge commit $COMMIT"
+                      exit 1
+                    fi
+                  }
+                  continue
+                fi
+              fi
+
+
+              # Apply the cherry-pick for non-merge commits
+              git cherry-pick --strategy=recursive --strategy-option=theirs "$COMMIT" || {
+                echo "Cherry-pick failed for commit $COMMIT"
+                exit 1
+              }
+            done
+
+
+
+            echo "Pushing release branch: $BRANCH_NAME"
+            git remote set-url origin git@github.com:${{ github.repository }}.git
+            git push origin "$BRANCH_NAME" --force
+
+
+
+          
+      # Fetch and Lock Target Branch
+      - name: Fetch and Lock Target Branch
+        run: |
+          
+          # Fetch protection settings
+            PROTECTION_SETTINGS=$(curl -s -H "Authorization: token ${GITHUB_TOKEN}" \
+                                      -H "Accept: application/vnd.github+json" \
+                                      "${REPO_URL}branches/${TARGET_BRANCH}/protection")
+
+
+
+            # Echo the fetched protection settings for debugging
+            echo "$PROTECTION_SETTINGS"
+
+
+
+          echo "Current protection settings for $TARGET_BRANCH: $PROTECTION_SETTINGS"
+
+
+
+          # Fetch current protection settings and update lock_branch while retaining other values
+          UPDATED_SETTINGS=$(echo "$PROTECTION_SETTINGS" | jq '{
+            required_status_checks: .required_status_checks,
+            enforce_admins: .enforce_admins.enabled,
+            required_pull_request_reviews: .required_pull_request_reviews,
+            restrictions: .restrictions,
+            lock_branch: true
+          }')
+
+
+
+          # Debugging: Display the payload and URL
+          echo "Request URL: ${REPO_URL}branches/${TARGET_BRANCH}/protection"
+          echo "Updated Payload: $UPDATED_SETTINGS"
+
+
+
+          # Perform the PUT request
+          curl -X PUT \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d "$UPDATED_SETTINGS" \
+            "${REPO_URL}branches/${TARGET_BRANCH}/protection"
+
+
+
+          echo "$TARGET_BRANCH branch protection rules updated to lock."

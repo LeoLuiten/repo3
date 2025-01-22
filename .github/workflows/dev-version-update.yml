@@ -1,0 +1,148 @@
+name: Lisa Versioning Update (Development)
+
+
+on:
+  push:
+    branches:
+      - development
+
+
+jobs:
+  versioning:
+    runs-on: ubuntu-latest
+    outputs:
+      latest_commit_hash: ${{ steps.get_commit_details.outputs.LATEST_COMMIT_HASH }}
+      latest_commit_msg: ${{ steps.get_commit_details.outputs.LATEST_COMMIT_MSG }}
+      latest_commit_date: ${{ steps.get_commit_details.outputs.LATEST_COMMIT_DATE }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+
+      - name: Set up Git
+        run: |
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Action Bot"
+
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+
+      - name: Get latest commit details
+        run: |
+          # Get the latest commit hash, message, and date for the triggering repository
+          LATEST_COMMIT_HASH=$(git rev-parse HEAD)
+          LATEST_COMMIT_MSG=$(git log -1 --pretty=%B)
+          LATEST_COMMIT_DATE=$(git log -1 --pretty=%cI)
+          
+          echo "Latest commit hash: $LATEST_COMMIT_HASH"
+          echo "Latest commit message: $LATEST_COMMIT_MSG"
+          echo "Latest commit date: $LATEST_COMMIT_DATE"
+
+
+      - name: Update versioning file
+        run: |
+        
+          echo "Starting versioning update for development branch..."
+        
+          # Repository and file settings
+          REPO="https://api.github.com/repos/LeoLuiten/versioning"
+          VERSION_FILE="versioning.json"
+          BRANCH="Lisa"
+          PAT="${{ secrets.supertoken }}"
+        
+          # Get the latest commit details
+          LATEST_COMMIT_HASH=$(git rev-parse HEAD)
+          LATEST_COMMIT_MSG=$(git log -1 --pretty=%B)
+          LATEST_COMMIT_DATE=$(git log -1 --pretty=%cI)
+          CURRENT_REPO=$(basename $(git rev-parse --show-toplevel))
+        
+          echo "Latest commit hash: $LATEST_COMMIT_HASH"
+          echo "Latest commit message: $LATEST_COMMIT_MSG"
+          echo "Latest commit date: $LATEST_COMMIT_DATE"
+          echo "Current repository: $CURRENT_REPO"
+        
+          # Fetch the current versioning.json from the specified branch
+          CURRENT_CONTENT=$(curl -s -H "Authorization: token $PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "$REPO/contents/$VERSION_FILE?ref=$BRANCH")
+        
+          # Extract the file's SHA and decode the content
+          SHA=$(echo "$CURRENT_CONTENT" | jq -r '.sha')
+          CURRENT_JSON=$(echo "$CURRENT_CONTENT" | jq -r '.content' | base64 --decode)
+        
+          # Extract the current development nextVersion
+          CURRENT_VERSION=$(echo "$CURRENT_JSON" | jq -r '.environments.development.nextVersion')
+          IFS='.' read -r -a VERSION_PARTS <<< "$CURRENT_VERSION"
+          MAJOR=${VERSION_PARTS[0]}
+          MINOR=${VERSION_PARTS[1]}
+          PATCH=${VERSION_PARTS[2]}
+        
+          # Increment version based on the commit message flags
+          if [[ "$LATEST_COMMIT_MSG" == *"--major"* ]]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          elif [[ "$LATEST_COMMIT_MSG" == *"--minor"* ]]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+          elif [[ "$LATEST_COMMIT_MSG" == *"v."* ]]; then
+            echo "Tagged commit detected (v.), skipping version modification."
+          else
+            PATCH=$((PATCH + 1))
+          fi
+
+
+          NEXT_VERSION="$MAJOR.$MINOR.$PATCH"
+          echo "Next development version: $NEXT_VERSION"
+
+
+          # Update JSON with the new nextVersion and lastCommit
+          UPDATED_JSON=$(echo "$CURRENT_JSON" | jq --arg version "$NEXT_VERSION" \
+            --arg hash "$LATEST_COMMIT_HASH" \
+            --arg repo "$CURRENT_REPO" \
+            --arg date "$LATEST_COMMIT_DATE" \
+            --arg message "$LATEST_COMMIT_MSG" \
+            '
+            .environments.development.nextVersion = $version |
+            .environments.development.lastCommit = {
+              "hash": $hash,
+              "repo": $repo,
+              "commitDate": $date,
+              "message": $message
+            }
+            ')
+
+
+          # Encode the updated JSON and prepare payload
+          PAYLOAD=$(cat <<EOF
+          {
+            "message": "Update $VERSION_FILE for development branch",
+            "content": "$(echo "$UPDATED_JSON" | base64 -w 0)",
+            "sha": "$SHA",
+            "branch": "$BRANCH"
+          }
+          EOF
+          )
+
+
+          # Commit the updated JSON
+          RESPONSE=$(curl -s -X PUT -H "Authorization: token $PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -d "$PAYLOAD" \
+            "$REPO/contents/$VERSION_FILE")
+
+
+          if [[ $(echo "$RESPONSE" | jq -r '.commit.sha') != "null" ]]; then
+            echo "Successfully updated $VERSION_FILE."
+          else
+            echo "Failed to update $VERSION_FILE. Response: $RESPONSE"
+            exit 1
+          fi
+              
+      
+
+
